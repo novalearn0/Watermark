@@ -7,7 +7,7 @@ Moving watermark uses FFmpeg filter_complex expressions — NO frame-by-frame Py
 import asyncio
 import os
 import re
-import subprocess
+import json
 from typing import Callable, Awaitable, Optional
 
 from utils.logger import ffmpeg_logger as log
@@ -25,7 +25,6 @@ async def get_video_info(path: str) -> dict:
     )
     if code != 0:
         raise RuntimeError(f"ffprobe failed: {err}")
-    import json
     data = json.loads(out)
     info = {"width": 1280, "height": 720, "duration": 0.0, "fps": 25.0}
     for stream in data.get("streams", []):
@@ -54,17 +53,12 @@ def _build_moving_text_filter(
     video_w: int,
     video_h: int,
 ) -> str:
-    """
-    Build FFmpeg drawtext filter for moving or static watermark text.
-    Uses FFmpeg expressions — no Python frame iteration.
-    """
-    font_size_px = max(10, int(font_size * (video_w / 1280)))  # scale to resolution
+    font_size_px = max(10, int(font_size * (video_w / 1280)))
     alpha = min(1.0, max(0.0, opacity))
 
-    # Escape special chars for FFmpeg drawtext
     escaped = (
         text.replace("\\", "\\\\")
-            .replace("'", "\u2019")  # avoid apostrophe issues
+            .replace("'", "\u2019")
             .replace(":", "\\:")
             .replace("%", "\\%")
     )
@@ -73,14 +67,8 @@ def _build_moving_text_filter(
         x_expr = "(W-tw)/2"
         y_expr = "(H-th)/2"
     else:
-        # Bounce across full video area
-        # Period = 2 * (W - tw) / speed  seconds for horizontal bounce
-        x_expr = (
-            f"abs(mod(t*{speed:.2f}, 2*(W-tw)) - (W-tw))"
-        )
-        y_expr = (
-            f"abs(mod(t*{speed*0.7:.2f}+{video_h/3:.1f}, 2*(H-th)) - (H-th))"
-        )
+        x_expr = f"abs(mod(t*{speed:.2f}, 2*(W-tw)) - (W-tw))"
+        y_expr = f"abs(mod(t*{speed*0.7:.2f}+{video_h/3:.1f}, 2*(H-th)) - (H-th))"
 
     filter_str = (
         f"drawtext=text='{escaped}'"
@@ -101,22 +89,17 @@ def _build_moving_image_filter(
     mode: str,
     video_w: int,
     video_h: int,
-) -> tuple[str, list[str]]:
-    """
-    Returns (filter_complex_string, extra_input_args).
-    The watermark image is scaled then moved using FFmpeg overlay expressions.
-    """
+) -> tuple:
     wm_w = max(40, int(video_w * size_frac))
     alpha = min(1.0, max(0.0, opacity))
 
     if mode == "static":
-        x_expr = f"(W-overlay_w)/2"
-        y_expr = f"(H-overlay_h)/2"
+        x_expr = "(W-overlay_w)/2"
+        y_expr = "(H-overlay_h)/2"
     else:
         x_expr = f"abs(mod(t*{speed:.2f}, 2*(W-overlay_w)) - (W-overlay_w))"
         y_expr = f"abs(mod(t*{speed*0.7:.2f}+100, 2*(H-overlay_h)) - (H-overlay_h))"
 
-    # [0:v] = video  [1:v] = watermark image
     filter_complex = (
         f"[1:v]scale={wm_w}:-1,format=rgba,"
         f"colorchannelmixer=aa={alpha:.2f}[wm];"
@@ -132,14 +115,10 @@ async def apply_watermark_video(
     settings: dict,
     progress_cb: Optional[Callable[[float], Awaitable[None]]] = None,
 ) -> str:
-    """
-    Apply moving watermark to a video file using FFmpeg.
-    Returns output_path on success, raises on failure.
-    """
     info = await get_video_info(input_path)
     w, h, duration = info["width"], info["height"], info["duration"]
-    mode = settings.get("mode", "moving")
-    wm_image = settings.get("watermark_file_id")  # local path set by caller if PNG
+    mode     = settings.get("mode", "moving")
+    wm_image = settings.get("watermark_file_id")
     wm_text  = settings.get("watermark_text", "@Channel")
     opacity  = float(settings.get("opacity", 0.7))
     size     = float(settings.get("size", 0.2))
@@ -149,7 +128,6 @@ async def apply_watermark_video(
 
     ffmpeg_log_path = os.path.join(LOGS_DIR, "ffmpeg.log")
 
-    # Build command
     cmd = ["ffmpeg", "-y", "-i", input_path]
     use_image_wm = wm_image and os.path.exists(str(wm_image))
 
@@ -176,44 +154,59 @@ async def apply_watermark_video(
 
     log.info(f"FFmpeg cmd: {' '.join(cmd)}")
 
-    # Run with progress tracking
+    # ── 10MB buffer — prevents LimitOverrunError on long videos ──────────
+    _LIMIT = 10 * 1024 * 1024
+
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=_LIMIT,
     )
 
     ffmpeg_stderr_lines = []
     last_progress = 0.0
+    _buf = b""
 
     async def read_stderr():
-        nonlocal last_progress
+        nonlocal last_progress, _buf
         assert proc.stderr
-        async for line in proc.stderr:
-            decoded = line.decode(errors="replace").strip()
-            ffmpeg_stderr_lines.append(decoded)
-            # Parse progress from "time=HH:MM:SS.ms"
-            if duration and duration > 0:
-                m = re.search(r"time=(\d+):(\d+):([\d.]+)", decoded)
-                if m:
-                    elapsed = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
-                    pct = min(99.0, (elapsed / duration) * 100)
-                    if pct - last_progress >= 10.0:
-                        last_progress = pct
-                        if progress_cb:
-                            try:
-                                await progress_cb(pct)
-                            except Exception:
-                                pass
+        # Raw chunk reading — avoids readline() LimitOverrunError entirely
+        while True:
+            try:
+                chunk = await proc.stderr.read(65536)
+            except Exception:
+                break
+            if not chunk:
+                break
+            _buf += chunk
+            while b"\n" in _buf:
+                line_b, _buf = _buf.split(b"\n", 1)
+                decoded = line_b.decode(errors="replace").strip()
+                if decoded:
+                    ffmpeg_stderr_lines.append(decoded[-500:])
+                if duration and duration > 0:
+                    m = re.search(r"time=(\d+):(\d+):([\d.]+)", decoded)
+                    if m:
+                        elapsed = (int(m.group(1)) * 3600
+                                   + int(m.group(2)) * 60
+                                   + float(m.group(3)))
+                        pct = min(99.0, (elapsed / duration) * 100)
+                        if pct - last_progress >= 10.0:
+                            last_progress = pct
+                            if progress_cb:
+                                try:
+                                    await progress_cb(pct)
+                                except Exception:
+                                    pass
 
     await asyncio.gather(read_stderr(), proc.wait())
     rc = proc.returncode
 
-    # Write FFmpeg log
     with open(ffmpeg_log_path, "a", encoding="utf-8") as f:
         f.write(f"\n{'='*60}\n")
         f.write(f"CMD: {' '.join(cmd)}\n")
-        f.write("\n".join(ffmpeg_stderr_lines))
+        f.write("\n".join(ffmpeg_stderr_lines[-50:]))
 
     if rc != 0:
         error_tail = "\n".join(ffmpeg_stderr_lines[-20:])
@@ -233,11 +226,7 @@ async def apply_watermark_image(
     output_path: str,
     settings: dict,
 ) -> str:
-    """
-    Apply watermark to an image using FFmpeg (supports JPG/PNG/WEBP).
-    Returns output_path.
-    """
-    mode     = settings.get("mode", "static")  # images: static by default
+    mode     = settings.get("mode", "static")
     wm_image = settings.get("watermark_file_id")
     wm_text  = settings.get("watermark_text", "@Channel")
     opacity  = float(settings.get("opacity", 0.7))
@@ -246,12 +235,10 @@ async def apply_watermark_image(
     font_sz  = int(settings.get("font_size", 40))
     color    = settings.get("color", "white")
 
-    # Get image dimensions via ffprobe
     code, out, err = await run_subprocess(
         "ffprobe", "-v", "quiet", "-print_format", "json",
         "-show_streams", input_path,
     )
-    import json
     w, h = 1280, 720
     try:
         data = json.loads(out)
@@ -296,3 +283,4 @@ async def apply_watermark_image(
         raise RuntimeError(f"FFmpeg image watermark failed:\n{stderr[-2000:]}")
 
     return output_path
+    
