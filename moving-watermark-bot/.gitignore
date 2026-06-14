@@ -1,0 +1,11 @@
+.env
+*.session
+*.session-journal
+__pycache__/
+*.pyc
+*.pyo
+temp/
+logs/
+*.db
+*.db-journal
+.DS_Store
